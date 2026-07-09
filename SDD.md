@@ -156,70 +156,253 @@ else:
 
 ### 4.1 Recursive Scanning (`-r`)
 
-**Problem:** All modes hardcode `-maxdepth 1`. TOSEC has subdirs per format (`[D64]/`, `[TAP]/`). Bitsavers is 16 levels deep. RetroAchievements nests multi-disc games in subdirectories.
+**Problem:** All modes hardcode `-maxdepth 1`. This is a fatal limitation for real-world use:
+
+| Data Section | Depth | Files at top level | Files nested | Use Case |
+|-------------|-------|--------------------|-------------|----------|
+| Redump | 2 | 5,525 (all in `Letter/` subdirs) | 0 | `-r` to scan `Redump/` root and pick up all letters |
+| TOSEC | 3-5 | 0 | 647,687 | Must recurse: `Commodore/Amiga/Games/[ADF]/file.zip` |
+| Bitsavers | 3-16 | 0 | 186,967 | Must recurse: `bits/DEC/pdp11/dectape/file` |
+| RetroAchievements | 2-5 | ~12,000 | ~3,600 (multi-disc subdirs) | `-r` to reach `Final Fantasy VII (USA)/` subdir |
+| tosec-pix | 3-6 | 0 | 16,648 | Nested: `commodore/Amiga/Magazines/01 For Amiga/file.zip` |
+| No-Intro | 2 | 1,720 (in `Platform/` subdirs) | 0 | `-r` to scan across all platforms |
 
 **Design:**
-- Add `-r` (recurse) flag to all modes
-- When set, `find` uses default depth (no `-maxdepth`)
-- Default behavior remains `-maxdepth 1` for backward compatibility
-- `-s` (sort) needs special handling: sort only at the level requested, not into nested subdirs
-- `-z` (recompress): recurse into subdirs but write output to same subdir
 
-**Impact:** Every mode's `find` command line changes from:
+New global flag: `-r` (recurse). Default remains `maxdepth 1` for safety — accidentally running a destructive mode on `-i /media/DataCore` without `-r` limits blast radius to one directory.
+
 ```bash
-find "$DIR" -maxdepth 1 -type f -print0
+RECURSE=0
+# ... in arg parsing:
+-r) RECURSE=1; shift ;;
 ```
-to:
+
+A shared helper function replaces ad-hoc `find` calls in every mode:
+
 ```bash
-if [[ $RECURSE -eq 1 ]]; then
-    find "$DIR" -type f -print0
-else
-    find "$DIR" -maxdepth 1 -type f -print0
-fi
+collect_files() {
+    local dir="$1"
+    if [[ $RECURSE -eq 1 ]]; then
+        find "$dir" -type f -print0 2>/dev/null
+    else
+        find "$dir" -maxdepth 1 -type f -print0 2>/dev/null
+    fi
+}
 ```
+
+**Mode-specific behavior:**
+
+| Mode | With `-r` | Without `-r` (default) |
+|------|-----------|----------------------|
+| `-f` find | Walk full tree, output relative paths from `-i` | Flat scan only |
+| `-d` delete | File list must contain paths relative to `-i` | Flat names only |
+| `-v` verify | Verify all archives recursively | Top-level only |
+| `-n` normalize | Rename files in-place wherever found | Top-level only |
+| `-s` sort | **Sort each directory independently** — see below | Top-level only |
+| `-1` 1G1R | Group games across all subdirs, keep best location | Top-level only |
+| `-m` merge | Diff full trees, show paths relative to each root | Top-level only |
+| `-c` checksum | Hash all files, path includes subdirs | Top-level only |
+| `-x` index | Catalog full tree with relative paths | Top-level only |
+| `-z` recompress | Recompress in-place, output wherever source was found | Top-level only |
+
+**Sort mode with `-r` — special design:**
+
+When `-s -r` is used, each directory in the tree gets its own A-Z sort independently. This is because:
+- TOSEC already groups by platform/category: `Commodore/C64/Games/` shouldn't merge with `Commodore/Amiga/Games/`
+- Each subdirectory is a logical bucket; sorting within buckets preserves the existing organization
+- Sorting across buckets would destroy the TOSEC category structure
+
+Algorithm:
+```bash
+# Collect all directories containing files
+while IFS= read -r -d '' file; do
+    dir=$(dirname "$file")
+    dirs["$dir"]=1
+done < <(collect_files "$DIR")
+
+# Sort each directory independently
+for d in "${!dirs[@]}"; do
+    sort_files_in "$d"  # same logic as flat sort mode
+done
+```
+
+Files already in sorted subdirs (like `A/`, `Y/`, `#/`) are skipped to avoid double-nesting.
 
 ### 4.2 Extension Filter (`-e`)
 
-**Problem:** Running verify on Bitsavers would attempt `unzip -t` on PDFs, `unrar t` on `.tap.gz` files, etc. Over 180K files, that's thousands of meaningless skip messages.
+**Problem:** Without extension filtering, every mode processes all files regardless of type. Concrete issues:
+
+1. **Verify on Bitsavers** — 68K PDFs each trip `unzip -t` → "unsupported" skip message. 4,500 `.bin` firmware files, 3,800 `.txt` indexes, 1,300 `.tif` scans all produce skip noise. Only 3,034 zips are actually verifiable.
+2. **Checksum on Bitsavers** — Computing SHA1 on 1.8 TB of PDFs when you only want ROM hashes wastes hours.
+3. **Recompress on mixed dir** — Tries to recompress `.tap.gz` and `.dsk` files which aren't zips. The `find -name '*.zip'` in the current code pre-filters, but that's hardcoded — no user control.
+4. **Sort on Bitsavers PDFs** — Moving thousands of PDFs into A-Z subdirs destroys the existing `pdf/dec/`, `pdf/ibm/` organizational structure.
 
 **Design:**
-- Add `-e <ext1,ext2,...>` to `-v`, `-c`, `-z`, `-f`, `-1`, `-n`, `-s`
-- Only process files matching the listed extensions
-- Comma-separated, case-insensitive
-- `-e zip,7z` for ROM-only verify
-- `-e pdf` for Bitsavers documentation index
-- `-e zip` for TOSEC/Redump recompress
+
+New option: `-e <pattern>` where pattern is a comma-separated list of extensions (without dots). Stored as a lookup string.
 
 ```bash
-# Skip non-matching extensions at the file iteration level
-ext="${fname##*.}"
-ext_lower="${ext,,}"
-if [[ "$EXT_FILTER" != "*" ]]; then
-    [[ ",${EXT_FILTER}," != *",${ext_lower},"* ]] && continue
-fi
+EXT_FILTER=""          # empty = all extensions pass
+EXT_FILTER_LOOKUP=""   # ",zip,7z,chd," for O(1) check
+
+# In arg parsing:
+-e) EXT_FILTER="$2"
+    EXT_FILTER_LOOKUP=",$(echo "$2" | tr '[:upper:]' '[:lower:]' | sed 's/, */,/g'),"
+    shift 2 ;;
 ```
+
+A shared filter function used in every file loop:
+
+```bash
+passes_filter() {
+    local fname="$1"
+    [[ -z "$EXT_FILTER" ]] && return 0
+    local ext="${fname##*.}"
+    ext=$(echo "$ext" | tr '[:upper:]' '[:lower:]')
+    [[ "$EXT_FILTER_LOOKUP" == *",$ext,"* ]] && return 0
+    return 1
+}
+```
+
+**Which modes support `-e`:**
+
+| Mode | `-e` supported? | Typical usage |
+|------|----------------|---------------|
+| `-f` find | Yes | `-e zip -r -i TOSEC` — only check ROMs, skip format subdir placeholders |
+| `-d` delete | N/A | Follows whatever list file was generated |
+| `-v` verify | Yes | `-e zip,7z,chd,rvz` — verify executable archives only |
+| `-n` normalize | Yes | `-e zip` — only rename ROMs, leave PDFs alone |
+| `-s` sort | Conditional | `-e zip` when sorting ROMs; no filter when sorting PDF libraries |
+| `-1` 1G1R | Yes | `-e zip` — only game ROMs, not documentation |
+| `-m` merge | Yes | `-e zip,chd,rvz` — compare ROM collections, not sidecar files |
+| `-c` checksum | Yes | `-e zip` — DAT generation for ROM sets only |
+| `-x` index | Yes | `-e pdf` — catalog Bitsavers docs only; `-e zip` — catalog ROM set only |
+| `-z` recompress | Yes | `-e zip` — already the default, explicit override |
+
+**Interaction with `-r`:**
+
+`-e` and `-r` compose naturally. A filter runs per-file after the file list is collected. The combination `-r -e zip -v -i /media/DataCore/TOSEC` would walk the full TOSEC tree but only verify zip files — skipping any stray `.txt`, `.nfo`, `.png` files that might exist alongside ROMs.
+
+**Interaction with verify mode:**
+
+`-e` pre-filters before `verify_one()` even sees the file. This means extraneous skip messages are eliminated at the source rather than inside the verify worker. The `--verbose` flag in verify mode then only shows skip messages for files the user WANTED to check (e.g., `-e zip,7z` but file is `.rar` — useful "you asked for these but they're the wrong type" feedback).
 
 ### 4.3 Multi-Disc 1G1R
 
-**Problem:** Current 1G1R picks the single highest-scoring file from a game group. For multi-disc games, this drops every disc except one.
+**Problem:** Current 1G1R selects one file per game group. Multi-disc games are treated as independent files — Disc 2 of the winning variant is dropped because Disc 1 scored marginally higher (larger file? tie-break?). Real-world failures:
 
-**Design:**
-- After determining the winner, scan the loser pool for sibling discs
-- Match by: same game name, same region, same version/date, different disc number
-- Promote sibling discs from DROP to KEEP
-- Alternatively: group by game+region variant first, then pick best variant, keep all discs of that variant
-
-**Algorithm change:**
 ```
-for each game group:
-    1. Sub-group by (game_name + region + version + year)
-    2. Score each sub-group as a unit (best score of any disc)
-    3. Keep all discs of the winning sub-group
-    4. Drop all discs of losing sub-groups
+[game] 007 - Nightfire
+  KEEP  007 - Nightfire (USA) (Disc 2).zip     ← wins by tie-break
+  DROP  007 - Nightfire (USA) (Disc 1).zip     ← needed for playback!
+  DROP  007 - Nightfire (Europe) (Disc 1).zip
+  DROP  007 - Nightfire (Japan) (Ja).zip
 ```
 
-This handles: `007 Nightfire (USA) (Disc 1).zip` + `(Disc 2).zip` both kept;  
-`007 Nightfire (Europe) (Disc 1).zip` dropped.
+```
+[game] Yinyi Shashou
+  KEEP  Yinyi Shashou (China) (En,Zh) (Disc 2) (Rerelease).zip
+  DROP  Yinyi Shashou (China) (En,Zh) (Disc 1).zip          ← also needed!
+  DROP  Yinyi Shashou (China) (En,Zh) (Disc 1) (Rerelease).zip
+```
+
+**Design — sub-grouping by variant:**
+
+Instead of one flat pool per game name, files are sub-grouped by _variant signature_:
+
+```
+variant_signature = game_name + "|" + region + "|" + languages + "|" + version + "|" + year
+```
+
+Algorithm:
+
+```
+Phase 1: Parse and group
+  For each file:
+    1. Extract game_name (text before first '(')
+    2. Build variant key: game_name|region|langs|version|year
+    3. Append file to game_groups[game_name]
+    4. Append file to variant_groups[variant_key]
+
+Phase 2: Score variants
+  For each variant_key:
+    Score = compute_score(any file in the variant)
+    All files in this variant share the same score
+    variant_scores[variant_key] = score
+
+Phase 3: Select winners
+  For each game_name:
+    Find the variant_key with highest variant_scores[]
+    That's the winning variant
+    KEEP all files belonging to the winning variant
+    DROP all files belonging to other variants
+```
+
+**Variant key examples:**
+
+| File | Variant Key |
+|------|-------------|
+| `007 Nightfire (USA) (Disc 1).zip` | `007 Nightfire\|USA\|\|\|` |
+| `007 Nightfire (USA) (Disc 2).zip` | `007 Nightfire\|USA\|\|\|` ← same key! |
+| `007 Nightfire (Europe) (Disc 1).zip` | `007 Nightfire\|Europe\|\|\|` |
+| `Yinyi Shashou (China) (En,Zh) (Disc 1) (Rerelease).zip` | `Yinyi Shashou\|China\|En,Zh\|\|` |
+| `Yinyi Shashou (China) (En,Zh) (Disc 2) (Rerelease).zip` | `Yinyi Shashou\|China\|En,Zh\|\|` ← same key! |
+| `Final Fantasy VII (USA) (Disc 1).zip` | `Final Fantasy VII\|USA\|\|\|` |
+| `Final Fantasy VII (USA) (Disc 2).zip` | `Final Fantasy VII\|USA\|\|\|` ← same key! |
+| `Final Fantasy VII (USA) (Disc 3).zip` | `Final Fantasy VII\|USA\|\|\|` ← same key! |
+
+**Expected output after fix:**
+
+```
+[game] 007 - Nightfire
+    KEEP  007 - Nightfire (USA) (Disc 1).zip
+    KEEP  007 - Nightfire (USA) (Disc 2).zip
+    DROP  007 - Nightfire (Europe) (Disc 1).zip
+    DROP  007 - Nightfire (Japan) (Ja).zip
+  Var: USA  |  Europe  |  Japan
+
+[game] Yinyi Shashou
+    KEEP  Yinyi Shashou (China) (En,Zh) (Disc 1) (Rerelease).zip
+    KEEP  Yinyi Shashou (China) (En,Zh) (Disc 2) (Rerelease).zip
+    DROP  Yinyi Shashou (China) (En,Zh) (Disc 1).zip
+  Var: China+En,Zh+Rerelease  |  China+En,Zh
+
+[game] Final Fantasy VII
+    KEEP  Final Fantasy VII (USA) (Disc 1).zip
+    KEEP  Final Fantasy VII (USA) (Disc 2).zip
+    KEEP  Final Fantasy VII (USA) (Disc 3).zip
+    DROP  Final Fantasy VII (Japan) (Ja) (Disc 1).zip
+    DROP  Final Fantasy VII (Japan) (Ja) (Disc 2).zip
+    DROP  Final Fantasy VII (Japan) (Ja) (Disc 3).zip
+    DROP  Final Fantasy VII (Europe) (Disc 1).zip
+    DROP  Final Fantasy VII (Europe) (Disc 2).zip
+  Var: USA  |  Japan+Ja  |  Europe
+```
+
+**Edge cases:**
+
+1. **Single-disc games** — Variant key has only one file. No behavior change from current.
+2. **Multi-disc with inconsistent tags** — `(Disc 1)` has `(Rerelease)` but `(Disc 2)` doesn't. Solution: the variant key includes Rerelease flag. If Disc 1 says `Rerelease` and Disc 2 doesn't, they get _different_ variant keys and compete separately. This is correct — an inconsistent set is likely a mismatched collection.
+3. **Games with no region tag** — Region is empty string in the key: `GameName\|\|\|\|`. All files with no region share this key.
+4. **Multi-disc + multi-language** — `Euro Truck Simulator (Europe) (En,De) (Disc 1)` and `(Europe) (En,Fr) (Disc 2)` — different languages, different variant keys, split correctly. Won't merge.
+5. **Games named with parens in title** — `You Don't Know Jack` is fine because `gname()` stops at first `(`. But a hypothetical `Foo (Bar) (USA).zip` would parse game name as `Foo` — the `(Bar)` is lost. Rare in practice; acceptable limitation.
+6. **TOSEC multi-part** — `[Z64 Part 1-4]` is not extracted by current parser. These would compete independently under 1G1R until §4.5 (TOSEC bracket parsing) is implemented.
+
+**Scoring a variant (not a single file):**
+
+When scoring a variant that contains multiple files:
+```bash
+variant_score() {
+    local best=0
+    for file in variant_files; do
+        local s=$(score_file "$file")
+        [[ $s -gt $best ]] && best=$s
+    done
+    echo $best
+}
+```
+
+The variant's score is the MAX of its members, not the SUM. This prevents a 3-disc game from outscoring a 1-disc game simply because it has more files.
 
 ### 4.4 CHD Verification
 
