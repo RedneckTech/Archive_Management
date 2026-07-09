@@ -512,7 +512,532 @@ Hash: a1b2c3d4... (3 copies, 1.2 GB wasted)
 
 ---
 
-## 5. Implementation Order
+## 5. Safety Architecture
+
+### 5.1 Design Principles
+
+1. **Zero data loss by default.** No destructive operation executes without explicit confirmation. A mis-typed flag, wrong directory, or incorrect `-i` path must never cost real data.
+2. **Reversible where possible.** If an operation can be undone without complexity (renames, moves within same filesystem), the undo path is recorded.
+3. **Verifiable after mutation.** Every destructive mode produces an audit trail so the operator can confirm exactly what happened.
+4. **Defense in depth.** Multiple independent safety layers — no single flag, check, or confirmation gate is the sole protection.
+5. **Fail closed.** If any pre-flight check cannot be completed (missing tool, ambiguous path, permission error), the operation aborts rather than proceeding blind.
+
+### 5.2 Destructive Mode Classification
+
+Modes are ranked by consequence severity:
+
+| Level | Modes | Consequence | Reversible? |
+|-------|-------|-------------|-------------|
+| 0 — Read | `-f`, `-v`, `-c`, `-x`, `-m` | None. Read-only. | N/A |
+| 1 — Metadata | `-n` | Filename change. Inode unchanged. | Yes — names logged in `audit-YYYYMMDD-HHMMSS.log` |
+| 2 — Move | `-s` | Relocation within filesystem. Inode unchanged if same mount. | Yes — source dirs logged, `mv` is atomic |
+| 3 — Transform | `-z` | Original file deleted, new file created. New inode. | Only if `--keep` is used |
+| 4 — Delete | `-d`, `-1`, `-D` | Irreversible file removal. | No — requires external backup |
+
+Each level inherits all guards from the levels below it, plus additional level-specific protections.
+
+### 5.3 Layer 0: Pre-Flight Checks
+
+Executed once at startup, before any file is touched. If any check fails, the script exits with code 2 and a diagnostic message.
+
+#### 5.3.1 Path Existence and Type
+
+```
+CHECK: -i <dir> must exist and be a directory
+FAIL:  "Error: /mnt/missing is not a directory"
+       exit 2
+
+CHECK: --with <dir> (merge mode) must exist and be a directory
+FAIL:  "Error: --with path '/tmp/nonexistent' not found"
+       exit 2
+
+CHECK: -i must be an absolute path or explicitly confirmed relative path
+       Relative paths are resolved to absolute before use to prevent
+       confusion when scripts are run from unexpected CWD.
+```
+
+#### 5.3.2 Write Permission
+
+```
+CHECK: For levels 1-4, the target directory must be writable.
+       test -w "$DIR" || fail
+FAIL:  "Error: $DIR is not writable"
+       exit 2
+
+CHECK: For -z (recompress), free space >= (largest zip * 3) in $DIR.
+       Extraction needs ~2x the zip size for temp data, plus the final 7z.
+       df_output=$(df -B1 "$DIR" | tail -1)
+       avail=$(echo "$df_output" | awk '{print $4}')
+       if [ $avail -lt $required ]; then
+           echo "Error: need $(numfmt --to=iec $required) free, have $(numfmt --to=iec $avail)"
+           exit 2
+       fi
+FAIL:  "Error: need 2.1 GB free, have 847 MB"
+       exit 2
+```
+
+#### 5.3.3 Dependency Verification
+
+```
+CHECK: For each mode, required external tools must be in PATH.
+       declare -A mode_deps=(
+           ["verify"]="unzip"
+           ["recompress"]="7z"
+           ["checksum"]="sha1sum"
+       )
+       for dep in ${mode_deps[$MODE]}; do
+           command -v "$dep" &>/dev/null || {
+               echo "Error: '$dep' not found — required by -$MODE"
+               exit 2
+           }
+       done
+
+       Optional deps produce warnings, not errors:
+       command -v unrar  &>/dev/null || echo "Warning: 'unrar' not found — RAR files will be skipped"
+       command -v chdman &>/dev/null || echo "Warning: 'chdman' not found — CHD files will be skipped"
+```
+
+#### 5.3.4 File Count Guard
+
+```
+CHECK: Count files before starting any level 3-4 operation.
+       file_count=$(collect_files "$DIR" | wc -l)
+
+CONFIRM: If file_count > 100 and mode is level 3-4, require numeric confirmation.
+         "WARNING: This will modify $file_count files in $DIR."
+         "Type the file count to confirm: "
+         read confirm_count
+         if [ "$confirm_count" != "$file_count" ]; then
+             echo "Aborted."
+             exit 1
+         fi
+
+RATIONALE: Typing the exact number forces the operator to read and
+          internalize the scale. A y/N prompt is too easy to breeze past.
+```
+
+#### 5.3.5 Mode-Specific Pre-Flight
+
+```
+-z (recompress):
+    CHECK: Verify that 7z can create test archive in $DIR.
+           touch "$DIR/.archive_man_test_$$" && rm -f "$DIR/.archive_man_test_$$"
+           Fails if filesystem is read-only or quota exceeded.
+
+    CHECK: TMPDIR has space (for extraction temp dirs).
+           Default TMPDIR may be on a small root partition — warn if < 10 GB.
+
+-d (delete), -1 (1G1R), -D (dedup):
+    CHECK: -i must NOT be "/", "/home", "/media", "/mnt", or any path
+           with depth < 2. Protects against catastrophic misconfiguration.
+           dir_depth=$(echo "$(realpath "$DIR")" | tr -cd '/' | wc -c)
+           if [ $dir_depth -lt 2 ]; then
+               echo "ERROR: Refusing to run destructive mode on top-level path: $DIR"
+               echo "       Minimum depth is 2 (e.g., /media/DataCore/Redump)"
+               exit 2
+           fi
+```
+
+### 5.4 Layer 1: Dry-Run and Confirmation Gates
+
+#### 5.4.1 Mandatory First-Run Dry-Run
+
+Destructive modes (`-d`, `-1`, `-z`, `-D`) track whether a dry-run was ever performed on the target directory. On first run without `--dry-run`, the script prints the proposed changes and requires explicit re-invocation.
+
+```
+STATE FILE:   $DIR/.archive_man_state
+FORMAT:       mode:timestamp:dry_run_count:real_run_count
+
+On startup for destructive modes:
+    read_state_file
+    if dry_run_count == 0 && DRY_RUN == 0:
+        echo "This mode requires a dry-run first."
+        echo "Running dry-run now..."
+        DRY_RUN=1
+        # proceed with dry-run, then exit
+        # user must re-run without --dry-run to execute
+
+RATIONALE: Forces the operator to see exactly what will happen before it happens.
+           The state file is per-directory, so different archives can have
+           different dry-run histories.
+```
+
+#### 5.4.2 Confirmation Prompt for Level 3-4
+
+```
+For -d, -1, -z, -D (non-dry-run):
+    Show summary of what will be done:
+    
+    "========================================="
+    "MODE:   1G1R (keep best version per game)"
+    "DIR:    /media/DataCore/RetroAchievements"
+    "FILES:  15,690 total, 12,340 will be KEPT, 3,350 will be DELETED"
+    "SPACE:  847 GB will be freed"
+    "========================================="
+    "Type 'yes, delete 3350 files' to confirm: "
+    
+    read confirmation
+    expected="yes, delete $files_to_delete files"
+    if [ "$confirmation" != "$expected" ]; then
+        echo "Confirmation failed — aborted."
+        exit 1
+    fi
+
+RATIONALE: A typed confirmation string that includes the exact count prevents
+          muscle-memory "y" responses. The operator must read, comprehend, and
+          accurately type back the scope of destruction.
+```
+
+#### 5.4.3 Path Display Before Execution
+
+```
+Before any destructive mode starts:
+    real=$(realpath "$DIR")
+    echo "Target directory: $real"
+    echo "Absolute path:    $real"
+    sleep 2  # brief pause to let operator CTRL-C
+    echo "Starting in 3..."
+    sleep 1
+    echo "Starting in 2..."
+    sleep 1
+    echo "Starting in 1..."
+    sleep 1
+
+RATIONALE: A 6-second delay with countdown gives the operator one last chance
+          to notice they pointed at the wrong directory.
+```
+
+### 5.5 Layer 2: Operation-Specific Guards
+
+#### 5.5.1 Delete Mode (`-d`)
+
+```
+GUARD: Each filename in the list file is validated before deletion.
+       1. Strip any path components (basename only) — prevent ../../etc/passwd
+       2. Reject names containing '/' or '\' — path traversal defense
+       3. Verify file exists before attempting rm
+       4. Verify file is a regular file, not a symlink or directory
+          [ -f "$target" ] && rm -f "$target"
+          (never follows symlinks to their targets)
+
+GUARD: List file itself is never deletable.
+       basename of list file is added to a skip-set before iteration.
+
+GUARD: Maximum batch size warning.
+       If list has > 10,000 entries, require additional confirmation.
+```
+
+#### 5.5.2 1G1R Mode (`-1`)
+
+```
+GUARD: Never delete the only copy of a game.
+       If game_groups[$game] has only 1 entry, it's always KEEP regardless of score.
+       (Already implemented — the "only" case.)
+
+GUARD: Ambiguous game name groups trigger a warning and skip deletion.
+       If two files have the same extracted game_name but wildly different
+       filenames (Levenshtein distance > threshold), they may be different games
+       with coincidentally similar prefixes. Flag as "ambiguous" and keep both.
+
+GUARD: Size sanity check.
+       If a game group contains files where sizes differ by > 5x, warn and skip.
+       A 50 MB "Disc 1" and a 3 GB "Disc 1" are probably different games.
+       
+       "WARNING: 'Star Wars (USA) (Disc 1).zip' (52 MB) differs drastically
+                 from 'Star Wars (Japan).zip' (3.1 GB). Keeping both. Review manually."
+
+GUARD: Prevents deleting files that share an inode (hardlinks).
+       stat -c '%h' to check link count. If > 1, warn — deleting would
+       not free space, and the other link should be cleaned up instead.
+```
+
+#### 5.5.3 Recompress Mode (`-z`)
+
+```
+GUARD: Atomic replacement.
+       The sequence must be:
+       1. Extract to temp dir (outside $DIR, in TMPDIR)
+       2. Create 7z in temp dir
+       3. Verify the 7z is valid (7z t)
+       4. MOVE (not copy) the 7z into $DIR
+       5. Only then delete the original zip
+       
+       NEVER: rm original → create 7z  (gap where data doesn't exist)
+       NEVER: create 7z alongside original → rm original (crash leaves both)
+       
+       CORRECT:
+       tmpdir=$(mktemp -d -t archive_man.XXXXXX)
+       trap "rm -rf $tmpdir" EXIT  # cleanup on any exit
+       
+       unzip -o "$original" -d "$tmpdir/extract" || { fail; return; }
+       7z a -mx=9 "$tmpdir/output.7z" "$tmpdir/extract/"* || { fail; return; }
+       7z t "$tmpdir/output.7z" || { fail; return; }
+       mv "$tmpdir/output.7z" "$DIR/$outname"      # atomic on same filesystem
+       rm -f "$original"                             # only after mv succeeds
+       rm -rf "$tmpdir"                              # cleanup
+
+GUARD: Temp directory must be on a different filesystem from $DIR if possible.
+       Prevents filling $DIR with temp extraction data during recompress.
+       Check: if TMPDIR is on same mount as DIR, warn:
+       "Warning: TMPDIR and target are on the same filesystem.
+                 Ensure adequate free space (2x largest zip)."
+
+GUARD: Never process the same file twice.
+       Track processed originals by inode. If a zip was already recompressed
+       (or its output 7z already exists), skip it.
+
+GUARD: Preserve original timestamps.
+       touch -r "$original" "$DIR/$outname"
+       So the new 7z inherits the original's mtime. Important for
+       tools that sort or filter by modification date.
+
+GUARD: Handle interrupted recompress cleanly (SIGINT/SIGTERM).
+       trap on EXIT removes temp dir.
+       Partial 7z in target dir is removed if script exits abnormally.
+       Original zip is never touched until 7z is fully verified.
+```
+
+#### 5.5.4 Sort Mode (`-s`)
+
+```
+GUARD: Never overwrite an existing file.
+       Before moving: if target exists, compare inodes.
+       Same inode → already in place, skip.
+       Different inode → name collision, warn and skip.
+       
+       [[ -e "$dest" ]] && {
+           if [ "$(stat -c '%i' "$file")" = "$(stat -c '%i' "$dest")" ]; then
+               continue  # already there
+           else
+               echo "  [conflict] $fname (target exists: $dest)"
+               continue
+           fi
+       }
+
+GUARD: Valid destination check.
+       Subdir names are always A-Z or # — prevents creating directories
+       with special characters from malicious filenames.
+       [[ "$subdir" =~ ^[A-Z]|#$ ]] || { echo "BUG: invalid subdir"; continue; }
+
+GUARD: No-op detection.
+       If the file is already in the correct subdirectory, skip.
+       "$(dirname "$file")" == "$DIR/$subdir" → already sorted.
+```
+
+#### 5.5.5 Normalize Mode (`-n`)
+
+```
+GUARD: No rename if target name already exists.
+       [[ -e "$DIR/$newname" ]] → warn, skip, do not overwrite.
+
+GUARD: Verify rename was successful before reporting.
+       If mv fails (permissions, filesystem error), report failure.
+       mv "$file" "$DIR/$newname" || echo "  [FAIL] $fname (mv failed: $?)"
+
+GUARD: Don't rename if the name didn't actually change.
+       (Already implemented — the "$fname" != "$newname" check.)
+
+GUARD: Filename length check.
+       Most filesystems limit filenames to 255 bytes.
+       New name with added comma-spaces might exceed this.
+       if [ ${#newname} -gt 255 ]; then warn and skip.
+```
+
+#### 5.5.6 Dedup Mode (`-D`, proposed §4.8)
+
+```
+GUARD: Every file in a duplicate group gets SHA1-verified against the KEEP
+       file before any deletion. A byte-for-byte comparison (cmp) on the
+       first and last 4096 bytes, plus full SHA1, confirms identity.
+
+GUARD: Never delete a file that is the target of a symlink.
+       If a symlink elsewhere in the tree points to this file, warn.
+
+GUARD: --link mode requires same filesystem.
+       Hardlinks only work within the same mount. Detect and warn if
+       KEEP and DROP are on different filesystems — fall back to copy+verify.
+
+GUARD: --symlink mode uses relative paths.
+       Symlinks should be relative (../../Redump/E/file.zip) not absolute,
+       so the tree remains portable across mount points.
+```
+
+### 5.6 Layer 3: Audit Trail and Reversal
+
+#### 5.6.1 Audit Log
+
+Every destructive mode writes a timestamped audit log:
+
+```
+FILE:    $DIR/.archive_man_audit/audit-YYYYMMDD-HHMMSS.log
+FORMAT:  TAB-separated: timestamp\tmode\taction\told_path\tnew_path\tsize_bytes\texit_code
+
+Example:
+2025-07-09T14:32:01Z	-1	DROP	Redump/Y/Yukon Trail, The (USA).zip			335260146	0
+2025-07-09T14:32:01Z	-1	KEEP	Redump/Y/Yukon Trail, The (USA) (Rerelease) (2003-02-20).zip		335320011	0
+2025-07-09T14:32:05Z	-z	OK	Redump/Y/Yager (USA).zip	Redump/Y/Yager (USA).7z	4521002343	0
+2025-07-09T14:32:05Z	-n	MV	Redump/Y/yager (USA).zip	Redump/Y/Yager (USA).zip	4521002343	0
+2025-07-09T14:32:10Z	-s	MV	Redump/incoming/Yager.zip	Redump/Y/Yager.zip	4521002343	0
+```
+
+#### 5.6.2 Undo File Generation
+
+For reversible operations (`-n`, `-s`), the audit log doubles as an undo script:
+
+```
+GENERATED:  $DIR/.archive_man_audit/undo-YYYYMMDD-HHMMSS.sh
+CONTENTS:   #!/bin/bash
+            # Undo script for archive_man -n run at 2025-07-09T14:32:05Z
+            mv "Redump/Y/Yager (USA).zip" "Redump/Y/yager (USA).zip"
+            mv "Redump/Y/Yellow Hippo (USA) (En, Es).zip" "Redump/Y/Yellow Hippo (USA) (En,Es).zip"
+            ...
+            echo "Undo complete. $(wc -l < undo.sh) files restored."
+```
+
+The undo script is:
+- Executable (`chmod +x`)
+- Idempotent (checks if target exists before moving)
+- Validated for correctness (each line is the exact inverse of the audit entry)
+
+#### 5.6.3 Audit Directory Structure
+
+```
+$DIR/.archive_man_audit/
+├── audit-20250709-143200.log     # full audit trail
+├── undo-20250709-143200.sh       # undo script (for -n, -s only)
+├── checksums-pre-20250709-150000.sha1  # pre-mutation checksums (-z, -1, -D)
+├── checksums-post-20250709-150000.sha1 # post-mutation checksums
+└── state.json                     # dry-run counters, last runs
+```
+
+### 5.7 Layer 4: Post-Operation Verification
+
+#### 5.7.1 Delete Verification
+
+```
+After -d, -1, -D completes:
+    Verify that files marked DROP no longer exist.
+    Verify that files marked KEEP still exist and are non-zero.
+    Report any discrepancies:
+        "Post-delete check: 3348/3350 files deleted correctly."
+        "2 files could not be deleted (permission denied): ..."
+        "All 12340 kept files verified present."
+```
+
+#### 5.7.2 Recompress Verification
+
+```
+After -z completes:
+    1. Verify output 7z is valid (7z t)
+    2. Verify original zip no longer exists (unless --keep)
+    3. Verify output 7z size > 0
+    4. Compute and log compression ratio:
+       orig_total=..., new_total=..., saved=...%
+    5. If verification fails, leave original intact and report failure
+```
+
+#### 5.7.3 Sort Verification
+
+```
+After -s completes:
+    Verify no files remain at top level (if that was the intent).
+    Verify each subdir contains only files starting with the correct letter.
+    Verify no files were lost: count(files in subdirs) == count(files pre-sort).
+```
+
+#### 5.7.4 Checksum-Based Verification
+
+```
+For -z and -D: optional --verify-checksums flag.
+    Before mutation: compute SHA1 of all files to be affected → pre.sha1
+    After mutation:  for -z, extract new 7z and SHA1 its contents
+                     for -D, SHA1 the KEEP file → must match pre.sha1
+    Content identity confirmed before old files are deleted.
+```
+
+### 5.8 Signal Handling
+
+```
+trap 'cleanup_and_exit' EXIT INT TERM HUP
+
+cleanup_and_exit() {
+    local exit_code=$?
+    
+    # Remove any temp directories
+    [ -n "${TEMP_DIRS[*]:-}" ] && rm -rf "${TEMP_DIRS[@]}"
+    
+    # Remove partially-written output files
+    [ -n "${PARTIAL_FILE:-}" ] && [ -f "$PARTIAL_FILE" ] && rm -f "$PARTIAL_FILE"
+    
+    # For -z: any in-progress .7z in target dir is likely corrupt
+    # The trap knows the current file being processed
+    [ -n "${CURRENT_7Z_OUT:-}" ] && [ -f "$CURRENT_7Z_OUT" ] && {
+        echo "Removing incomplete 7z: $CURRENT_7Z_OUT"
+        rm -f "$CURRENT_7Z_OUT"
+    }
+    
+    # Write partial audit log entry for interrupted operation
+    echo "$(date -Iseconds)\t$MODE\tINTERRUPTED\t${CURRENT_FILE:-unknown}\t\t\t$exit_code" \
+        >> "$AUDIT_LOG"
+    
+    exit $exit_code
+}
+
+CRITICAL: The trap must NOT rm the original zip during -z cleanup.
+          The original is only deleted in the success path, never in cleanup.
+          If the script is killed, the original zip survives.
+```
+
+### 5.9 Concurrent Run Protection
+
+```
+LOCKFILE:  $DIR/.archive_man.lock
+
+On startup:
+    exec 200>"$LOCKFILE"
+    if ! flock -n 200; then
+        echo "Error: Another archive_man is already running on $DIR"
+        echo "       Lock file: $LOCKFILE"
+        echo "       PID: $(cat "$LOCKFILE" 2>/dev/null || echo 'unknown')"
+        exit 2
+    fi
+    echo $$ > "$LOCKFILE"
+    # lock is automatically released on exit (flock + exec)
+
+RATIONALE: Two concurrent -z runs on the same directory would:
+          1. Both try to extract the same zip to different temp dirs (waste)
+          2. Race to delete the original zip (data loss if timing is wrong)
+          3. One might try to recompress a .7z the other just created (corruption)
+```
+
+### 5.10 Safety Interaction Matrix
+
+How each guard layer applies to each mode:
+
+| Safety Mechanism | `-f` | `-v` | `-c` | `-x` | `-m` | `-n` | `-s` | `-z` | `-1` | `-d` | `-D` |
+|-----------------|------|------|------|------|------|------|------|------|------|------|------|
+| Path validation | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Write permission check | — | — | — | — | — | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Dependency check | — | ✓ | ✓ | — | — | — | — | ✓ | — | — | ✓ |
+| File count confirm (100+) | — | — | — | — | — | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Depth guard (min 2) | — | — | — | — | — | — | — | — | ✓ | ✓ | ✓ |
+| First-run dry-run mandatory | — | — | — | — | — | — | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Typed confirmation string | — | — | — | — | — | — | — | ✓ | ✓ | ✓ | ✓ |
+| Countdown delay | — | — | — | — | — | — | — | ✓ | ✓ | ✓ | ✓ |
+| Atomic operations | — | — | — | — | — | ✓ | ✓ | ✓ | — | — | — |
+| Collision detection | — | — | — | — | — | ✓ | ✓ | ✓ | — | — | ✓ |
+| Post-op verification | — | — | — | — | — | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Audit log | — | — | — | — | — | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Undo script | — | — | — | — | — | ✓ | ✓ | — | — | — | — |
+| SIGINT safe cleanup | — | — | — | — | — | — | — | ✓ | — | — | ✓ |
+| Concurrent run lock | — | — | — | — | — | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Space pre-check | — | — | — | — | — | — | — | ✓ | — | — | — |
+| Free inode check | — | — | — | — | — | — | ✓ | ✓ | — | — | — |
+| Hardlink preservation | — | — | — | — | — | — | — | — | ✓ | — | ✓ |
+
+---
+
+## 6. Implementation Order
 
 | Priority | Feature | Effort | Impact | Risk |
 |----------|---------|--------|--------|------|
@@ -527,7 +1052,7 @@ Hash: a1b2c3d4... (3 copies, 1.2 GB wasted)
 
 ---
 
-## 6. Dependencies (Current + Proposed)
+## 7. Dependencies (Current + Proposed)
 
 | Tool | Required By | Availability |
 |------|-------------|-------------|
@@ -540,7 +1065,7 @@ Hash: a1b2c3d4... (3 copies, 1.2 GB wasted)
 
 ---
 
-## 7. Known Limitations
+## 8. Known Limitations
 
 1. **TOSEC find mode** — Flags all TOSEC files as non-English because region/language is in bracket flags, not paren tags. Will be addressed by §4.5.
 2. **Bitsavers find mode not applicable** — Documentation archives don't use region/language tags. `-f` is ROM-specific by design.
