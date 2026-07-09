@@ -6,7 +6,7 @@ set -euo pipefail
 # ============================================================
 
 VERSION="2.0.0"
-ENG_REGIONS='USA|Europe|Australia|UK|Canada'
+ENG_REGIONS='USA|Europe|Australia|UK|Canada|World'
 
 usage() {
     cat <<EOF
